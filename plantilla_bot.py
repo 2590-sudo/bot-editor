@@ -411,12 +411,23 @@ def calculate_exact_font_size(font_path, target_height, new_text, max_width=None
 # =====================================================
 # ANALISIS DE ESTILO
 # =====================================================
-def analyze_text_style(img, det):
+def capture_text_style(img, det):
+    """
+    FUNCION MAESTRA: Captura el estilo EXACTO del texto original.
+    Analiza color, tamano, peso (bold), tipo (serif/sans), fuente,
+    posicion exacta y baseline - todo en un solo pase.
+    
+    El resultado se usa directamente por apply_edit para renderizar
+    el texto nuevo con las mismas caracteristicas.
+    """
     x, y, w, h = det['x'], det['y'], det['w'], det['h']
     text = det['text']
-    pad = 3
+    H, W = img.shape[:2]
+
+    # ===== 1. EXTRAER CROP Y MASCARA BINARIA =====
+    pad = 4
     x1 = max(0, x - pad); y1 = max(0, y - pad)
-    x2 = min(img.shape[1], x + w + pad); y2 = min(img.shape[0], y + h + pad)
+    x2 = min(W, x + w + pad); y2 = min(H, y + h + pad)
     crop = img[y1:y2, x1:x2]
     if crop.size == 0:
         return default_style(w, h, x, y)
@@ -432,15 +443,13 @@ def analyze_text_style(img, det):
     else:
         text_mask = binary == 255
 
+    # ===== 2. COLOR EXACTO (pixeles core, sin bordes anti-alias) =====
     text_pixels = crop[text_mask]
     if len(text_pixels) > 0:
-        # Robust color: find pixels most different from background (core text)
         bg_pixels = crop[~text_mask]
         if len(bg_pixels) > 0:
             bg_color_arr = np.median(bg_pixels, axis=0)
-            # Distance from background for each text pixel
             dists = np.sqrt(np.sum((text_pixels.astype(float) - bg_color_arr) ** 2, axis=1))
-            # Take top 20% most distant pixels (core, not anti-aliased edges)
             threshold = np.percentile(dists, 80)
             core_pixels = text_pixels[dists >= threshold]
             if len(core_pixels) > 0:
@@ -452,97 +461,148 @@ def analyze_text_style(img, det):
     else:
         text_color_bgr = np.array([0, 0, 0])
 
-    # Detectar posicion exacta ANTES de nada
-    exact_pos = detect_exact_position(img, det)
-
+    # ===== 3. MEDICION EXACTA DE DIMENSIONES =====
     row_sums = np.sum(text_mask, axis=1)
+    col_sums = np.sum(text_mask, axis=0)
     text_rows = np.where(row_sums > 0)[0]
-    if len(text_rows) > 0:
-        actual_text_height = text_rows[-1] - text_rows[0] + 1
-    else:
-        actual_text_height = h
+    text_cols = np.where(col_sums > 0)[0]
 
-    text_pixel_count = np.count_nonzero(text_mask)
-    total_pixels = max(text_mask.size, 1)
-    fill_ratio = text_pixel_count / total_pixels
+    if len(text_rows) > 0 and len(text_cols) > 0:
+        actual_height = text_rows[-1] - text_rows[0] + 1
+        actual_width = text_cols[-1] - text_cols[0] + 1
+        tight_top = y1 + int(text_rows[0])
+        tight_left = x1 + int(text_cols[0])
+        tight_right = x1 + int(text_cols[-1]) + 1
+        tight_bottom = y1 + int(text_rows[-1]) + 1
+    else:
+        actual_height = h
+        actual_width = w
+        tight_top = y
+        tight_left = x
+        tight_right = x + w
+        tight_bottom = y + h
+
+    # ===== 4. DETECCION DE PESO (BOLD) =====
     binary_uint8 = (text_mask * 255).astype(np.uint8)
-    dist = cv2.distanceTransform(binary_uint8, cv2.DIST_L2, 5)
-    avg_stroke = 2 * np.median(dist[text_mask]) if np.any(text_mask) else 1
-    stroke_ratio = avg_stroke / max(actual_text_height, 1)
+    dist_transform = cv2.distanceTransform(binary_uint8, cv2.DIST_L2, 5)
+    avg_stroke = 2 * np.median(dist_transform[text_mask]) if np.any(text_mask) else 1
+    stroke_ratio = avg_stroke / max(actual_height, 1)
+    fill_ratio = np.count_nonzero(text_mask) / max(text_mask.size, 1)
     is_bold = stroke_ratio > 0.13 or fill_ratio > 0.28
 
-    col_sums = np.sum(text_mask, axis=0).astype(float)
-    col_std = np.std(col_sums) / max(np.mean(col_sums), 1)
+    # ===== 5. DETECCION DE TIPO (SERIF vs SANS) =====
     top_strip = text_mask[:max(2, h_c // 6), :]
     bottom_strip = text_mask[-max(2, h_c // 6):, :]
     top_density = np.sum(top_strip) / max(top_strip.size, 1)
     bottom_density = np.sum(bottom_strip) / max(bottom_strip.size, 1)
     mid_density = np.sum(text_mask[h_c//3:2*h_c//3, :]) / max(text_mask[h_c//3:2*h_c//3, :].size, 1)
     serif_score = (top_density + bottom_density) / max(2 * mid_density, 0.01)
+    col_std = np.std(col_sums.astype(float)) / max(np.mean(col_sums.astype(float)), 1)
     is_serif = serif_score > 1.15 and col_std > 0.8
 
-    logging.info(f"Estilo: bold={is_bold} stroke_ratio={stroke_ratio:.3f} fill={fill_ratio:.3f} serif={is_serif} h={actual_text_height}px")
-    best_font = match_font_render(gray, binary, text, actual_text_height, is_bold, is_serif)
+    # ===== 6. EXTRACCION DE CARACTERISTICAS DEL ORIGINAL =====
+    orig_binary = binary_uint8[tight_top - y1:tight_bottom - y1,
+                               tight_left - x1:tight_right - x1]
+    if orig_binary.size == 0 or orig_binary.shape[0] < 2 or orig_binary.shape[1] < 2:
+        orig_binary = binary_uint8
+    orig_features = extract_font_features(orig_binary)
+    orig_aspect = actual_width / max(actual_height, 1)
 
-    return {
-        'color_bgr': tuple(int(c) for c in text_color_bgr),
-        'actual_text_height': actual_text_height,
-        'is_bold': is_bold, 'is_serif': is_serif,
-        'fill_ratio': fill_ratio, 'avg_stroke': avg_stroke,
-        'font_name': best_font['name'], 'font_path': best_font['path'],
-        'font_score': best_font['score'],
-        'height': h, 'width': w,
-        'exact_pos': exact_pos,
-    }
+    logging.info(
+        f"Estilo capturado: bold={is_bold} stroke_r={stroke_ratio:.3f} "
+        f"fill={fill_ratio:.3f} serif={is_serif} h={actual_height}px w={actual_width}px "
+        f"color_bgr=({text_color_bgr[0]},{text_color_bgr[1]},{text_color_bgr[2]})"
+    )
 
-def default_style(w, h, x=0, y=0):
-    return {
-        'color_bgr': (0, 0, 0), 'actual_text_height': max(8, int(h * 0.72)),
-        'is_bold': False, 'is_serif': False,
-        'font_name': 'DejaVuSans',
-        'font_path': FONT_REGISTRY.get('DejaVuSans', {}).get('path', SYS_FONTS['DejaVuSans']),
-        'font_score': 0, 'height': h, 'width': w,
-        'exact_pos': {'top': y, 'left': x, 'bottom': y + h, 'right': x + w,
-                      'baseline': y + int(h * 0.75), 'center_x': x + w // 2,
-                      'center_y': y + h // 2, 'width': w, 'height': h},
-    }
+    # ===== 7. MATCHING DE FUENTE CON TAMANO EXACTO =====
+    best_font = match_font_exact(text, actual_height, actual_width,
+                                 orig_binary, orig_features, orig_aspect,
+                                 is_bold, is_serif)
 
-def match_font_render(gray_crop, binary_crop, text, est_height, is_bold, is_serif):
-    # Prueba TODAS las fuentes sin filtrar. La comparacion pixel a pixel
-    # (IoU + features + aspect) decide cual se parece mas al original.
-    h, w = gray_crop.shape
-    bg_mean = np.mean(gray_crop[binary_crop == 255]) if np.any(binary_crop == 255) else 128
-    text_mean = np.mean(gray_crop[binary_crop == 0]) if np.any(binary_crop == 0) else 128
-    if bg_mean > text_mean:
-        binary_mask = (binary_crop == 0).astype(np.uint8) * 255
+    # ===== 8. BASELINE =====
+    if len(text_rows) > 2:
+        row_density = row_sums.astype(float)
+        lower_start = len(row_density) * 2 // 3
+        lower_section = row_density[lower_start:]
+        if len(lower_section) > 0:
+            baseline = y1 + lower_start + int(np.argmax(lower_section))
+        else:
+            baseline = tight_bottom
     else:
-        binary_mask = (binary_crop == 255).astype(np.uint8) * 255
+        baseline = tight_bottom
 
-    rows = np.where(np.any(binary_mask > 0, axis=1))[0]
-    cols = np.where(np.any(binary_mask > 0, axis=0))[0]
-    if len(rows) == 0 or len(cols) == 0:
-        return {'name': 'DejaVuSans', 'path': SYS_FONTS['DejaVuSans'], 'score': 0}
-    orig_top, orig_bottom = rows[0], rows[-1] + 1
-    orig_left, orig_right = cols[0], cols[-1] + 1
-    orig_w = orig_right - orig_left
-    orig_h = orig_bottom - orig_top
+    style = {
+        'color_bgr': tuple(int(c) for c in text_color_bgr),
+        'actual_text_height': actual_height,
+        'actual_text_width': actual_width,
+        'is_bold': is_bold,
+        'is_serif': is_serif,
+        'fill_ratio': fill_ratio,
+        'avg_stroke': avg_stroke,
+        'stroke_ratio': stroke_ratio,
+        'font_name': best_font['name'],
+        'font_path': best_font['path'],
+        'font_size': best_font['font_size'],
+        'font_score': best_font['score'],
+        'height': h,
+        'width': w,
+        'exact_pos': {
+            'top': tight_top,
+            'left': tight_left,
+            'bottom': tight_bottom,
+            'right': tight_right,
+            'baseline': baseline,
+            'center_x': (tight_left + tight_right) // 2,
+            'center_y': (tight_top + tight_bottom) // 2,
+            'width': tight_right - tight_left,
+            'height': tight_bottom - tight_top,
+        },
+    }
 
-    orig_crop = binary_mask[orig_top:orig_bottom, orig_left:orig_right]
-    orig_features = extract_font_features(orig_crop)
-    orig_aspect = orig_w / max(orig_h, 1)
+    logging.info(
+        f"Fuente: {best_font['name']} size={best_font['font_size']}px "
+        f"score={best_font['score']:.3f}"
+    )
+    return style
 
-    # Renderizar a alta resolucion para calidad
-    render_size = max(20, int(est_height * 3))
 
-    best_score = -1; best_name = None; best_path = None
-    scores = []
+def match_font_exact(text, target_height, target_width,
+                     orig_binary, orig_features, orig_aspect,
+                     is_bold, is_serif):
+    """
+    Para cada fuente del registro:
+    1. Calcula el font_size exacto que produce target_height en pixeles
+    2. Renderiza el texto a ese tamano
+    3. Compara pixel a pixel (IoU) con el original
+    4. Compara features y aspect ratio
+    Devuelve la fuente con mejor score y SU tamano exacto ya calculado.
+    """
+    if target_height < 8:
+        target_height = 8
+
+    best_score = -1
+    best_name = None
+    best_path = None
+    best_size = target_height
+    all_scores = []
 
     for name, info in FONT_REGISTRY.items():
         try:
-            font = ImageFont.truetype(info['path'], render_size)
+            font_path = info['path']
         except:
             continue
 
+        # Calcular el font_size que produce target_height pixeles reales
+        font_size = find_font_size_for_height(font_path, target_height, text)
+        if font_size < 6:
+            continue
+
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except:
+            continue
+
+        # Renderizar texto
         dummy = Image.new('L', (3000, 500), 0)
         dd = ImageDraw.Draw(dummy)
         bbox = dd.textbbox((0, 0), text, font=font)
@@ -555,6 +615,7 @@ def match_font_render(gray_crop, binary_crop, text, est_height, is_bold, is_seri
         draw.text((20 - bbox[0], 20 - bbox[1]), text, fill=255, font=font)
         rendered = np.array(pil)
 
+        # Medir tight bbox del render
         r_rows = np.where(np.any(rendered > 0, axis=1))[0]
         r_cols = np.where(np.any(rendered > 0, axis=0))[0]
         if len(r_rows) == 0 or len(r_cols) == 0:
@@ -566,48 +627,137 @@ def match_font_render(gray_crop, binary_crop, text, est_height, is_bold, is_seri
         if r_h < 2 or r_w < 2:
             continue
 
-        # Escalar al EXACTO tamano de pixel del original
+        # Escalar al tamano exacto del original para comparar
         rendered_tight = rendered[r_top:r_bottom, r_left:r_right]
-        rendered_scaled = cv2.resize(rendered_tight, (orig_w, orig_h),
+        oh, ow = orig_binary.shape
+        rendered_scaled = cv2.resize(rendered_tight, (ow, oh),
                                      interpolation=cv2.INTER_AREA)
         rendered_bin = (rendered_scaled > 127).astype(np.uint8) * 255
 
         # IoU pixel a pixel
-        intersection = np.sum((orig_crop > 0) & (rendered_bin > 0))
-        union = np.sum((orig_crop > 0) | (rendered_bin > 0))
+        intersection = np.sum((orig_binary > 0) & (rendered_bin > 0))
+        union = np.sum((orig_binary > 0) | (rendered_bin > 0))
         iou = intersection / max(union, 1)
 
         # Features
         rend_features = extract_font_features(rendered_bin)
         feature_score = compare_features(orig_features, rend_features)
 
-        # Aspect ratio
+        # Aspect ratio del render vs original
         rend_aspect = r_w / max(r_h, 1)
         aspect_diff = abs(orig_aspect - rend_aspect) / max(orig_aspect, 0.01)
         aspect_score = max(0, 1 - aspect_diff)
 
-        # Score: 60% IoU + 25% features + 15% aspect
-        combined = 0.60 * iou + 0.25 * feature_score + 0.15 * aspect_score
+        # Score: 55% IoU + 25% features + 20% aspect
+        combined = 0.55 * iou + 0.25 * feature_score + 0.20 * aspect_score
 
-        scores.append((name, combined, iou, feature_score, aspect_score))
+        all_scores.append((name, combined, iou, feature_score, aspect_score, font_size))
 
         if combined > best_score:
             best_score = combined
             best_name = name
-            best_path = info['path']
+            best_path = font_path
+            best_size = font_size
 
     if best_path is None:
-        best_name = 'DejaVuSans'
-        best_path = SYS_FONTS.get('DejaVuSans', list(FONT_REGISTRY.values())[0]['path'])
+        best_name = 'DejaVuSerif' if is_serif else 'DejaVuSans'
+        best_path = SYS_FONTS.get(best_name, list(FONT_REGISTRY.values())[0]['path'])
+        best_size = target_height
         best_score = 0
 
     # Log top 3
-    scores.sort(key=lambda x: -x[1])
-    for s in scores[:3]:
-        logging.info(f"  {s[0]:30s} score={s[1]:.3f} iou={s[2]:.3f} feat={s[3]:.3f} aspect={s[4]:.3f}")
+    all_scores.sort(key=lambda x: -x[1])
+    for s in all_scores[:3]:
+        logging.info(
+            f"  {s[0]:30s} score={s[1]:.3f} iou={s[2]:.3f} "
+            f"feat={s[3]:.3f} aspect={s[4]:.3f} size={s[5]}"
+        )
 
-    logging.info(f"Font match: {best_name} score={best_score:.3f}")
-    return {'name': best_name, 'path': best_path, 'score': best_score}
+    return {
+        'name': best_name,
+        'path': best_path,
+        'font_size': best_size,
+        'score': best_score,
+    }
+
+
+def find_font_size_for_height(font_path, target_pixel_height, text):
+    """
+    Binary search: encuentra el font_size (point size) que produce
+    una altura de pixeles visibles igual a target_pixel_height.
+    Usa measure_rendered_pixel_height para medir real, no textbbox.
+    """
+    if target_pixel_height < 8:
+        target_pixel_height = 8
+
+    lo = 6
+    hi = target_pixel_height * 4
+    best_size = target_pixel_height
+    best_diff = 999999
+
+    for _ in range(25):
+        mid = (lo + hi) // 2
+        if mid < 6:
+            mid = 6
+        try:
+            font = ImageFont.truetype(font_path, mid)
+        except:
+            return best_size
+
+        pixel_h, _ = measure_rendered_pixel_height(font, text)
+        if pixel_h == 0:
+            lo = mid + 1
+            continue
+
+        diff = abs(pixel_h - target_pixel_height)
+        if diff < best_diff:
+            best_diff = diff
+            best_size = mid
+
+        if pixel_h < target_pixel_height:
+            lo = mid + 1
+        elif pixel_h > target_pixel_height:
+            hi = mid - 1
+        else:
+            best_size = mid
+            break
+
+        if lo > hi:
+            for candidate in [lo, max(6, hi)]:
+                try:
+                    fc = ImageFont.truetype(font_path, candidate)
+                    ph, _ = measure_rendered_pixel_height(fc, text)
+                    d = abs(ph - target_pixel_height)
+                    if d < best_diff:
+                        best_diff = d
+                        best_size = candidate
+                except:
+                    pass
+            break
+
+    return max(6, best_size)
+
+
+def default_style(w, h, x=0, y=0):
+    return {
+        'color_bgr': (0, 0, 0),
+        'actual_text_height': max(8, int(h * 0.72)),
+        'actual_text_width': w,
+        'is_bold': False, 'is_serif': False,
+        'fill_ratio': 0, 'avg_stroke': 1, 'stroke_ratio': 0,
+        'font_name': 'DejaVuSans',
+        'font_path': FONT_REGISTRY.get('DejaVuSans', {}).get('path', SYS_FONTS['DejaVuSans']),
+        'font_size': max(8, int(h * 0.72)),
+        'font_score': 0,
+        'height': h, 'width': w,
+        'exact_pos': {
+            'top': y, 'left': x, 'bottom': y + h, 'right': x + w,
+            'baseline': y + int(h * 0.75),
+            'center_x': x + w // 2, 'center_y': y + h // 2,
+            'width': w, 'height': h,
+        },
+    }
+
 
 def extract_font_features(binary_img):
     binary = binary_img > 0
@@ -624,7 +774,9 @@ def extract_font_features(binary_img):
     row_var = np.std(row_sums) / max(np.mean(row_sums), 1)
     edges = cv2.Canny(binary_img.astype(np.uint8) * 255, 30, 100)
     edge_density = np.count_nonzero(edges) / max(np.count_nonzero(binary), 1)
-    return {'fill': fill, 'stroke': stroke / max(h, 1), 'col_var': col_var, 'row_var': row_var, 'edge_density': edge_density}
+    return {'fill': fill, 'stroke': stroke / max(h, 1), 'col_var': col_var,
+            'row_var': row_var, 'edge_density': edge_density}
+
 
 def compare_features(f1, f2):
     keys = ['fill', 'stroke', 'col_var', 'row_var', 'edge_density']
@@ -638,6 +790,7 @@ def compare_features(f1, f2):
         total_diff += diff
     return max(0, 1 - (total_diff / len(keys)))
 
+
 # =====================================================
 # EDICION CON POSICIONAMIENTO Y TAMANO EXACTO
 # =====================================================
@@ -647,7 +800,7 @@ def apply_edit(working_img, det, style, new_text):
     # 1. Borrar texto con inpainting quirurgico
     erased = erase_text_precise(working_img, det)
 
-    # 2. Obtener posicion exacta del texto original
+    # 2. Obtener posicion y estilo exacto del texto original
     exact_pos = style.get('exact_pos', {})
     target_height = style.get('actual_text_height', h)
     target_top = exact_pos.get('top', y)
@@ -655,9 +808,11 @@ def apply_edit(working_img, det, style, new_text):
     target_baseline = exact_pos.get('baseline', y + int(h * 0.75))
     target_width = exact_pos.get('width', w)
 
-    # 3. Calcular tamano EXACTO de fuente con binary search
+    # 3. Usar la fuente elegida por capture_text_style,
+    #    pero recalcular el tamano exacto para el texto NUEVO
+    #    asi la altura de pixeles coincide sin importar mayusculas/minusculas
     font_path = style['font_path']
-    max_w = int(target_width * 1.05)
+    max_w = int(target_width * 1.08)
     font_size = calculate_exact_font_size(font_path, target_height, new_text, max_w)
     font = ImageFont.truetype(font_path, font_size)
 
@@ -893,7 +1048,7 @@ def handle_selection(message, user_id, chat_id):
 
     try:
         img = cv2.imread(sess['original_path'])
-        style = analyze_text_style(img, det)
+        style = capture_text_style(img, det)
         det['style'] = style
     except Exception as e:
         logging.error(f"Error analizando estilo: {e}\n{traceback.format_exc()}")
@@ -906,7 +1061,7 @@ def handle_selection(message, user_id, chat_id):
     safe_send(chat_id,
         f"✅ Zona {num}: \"{det['text'][:50]}\"\n\n"
         f"🎨 <i>Estilo clonado:</i>\n"
-        f"   Fuente: {s.get('font_name', '?')}\n"
+        f"   Fuente: {s.get('font_name', '?')} (size {s.get('font_size', '?')}px)\n"
         f"   Altura real: {s.get('actual_text_height', '?')}px\n"
         f"   Negrita: {'Si' if s.get('is_bold') else 'No'}\n"
         f"   Color RGB: ({color[2]}, {color[1]}, {color[0]})\n"
